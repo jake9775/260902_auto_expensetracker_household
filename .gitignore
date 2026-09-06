@@ -1,0 +1,9 @@
+# 파이썬
+__pycache__/
+*.pyc
+
+# 엑셀 임시파일
+~$*.xlsx
+
+# Claude Code(OMC) 내부 세션 상태 - 프로젝트 소스 아님
+.omc/
