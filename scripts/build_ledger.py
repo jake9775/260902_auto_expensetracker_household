@@ -21,7 +21,7 @@ import openpyxl
 from openpyxl.styles import Font
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from parsers import coupang, google_play, hyundai_card, naver_pay, woori_bank  # noqa: E402
+from parsers import coupang, google_play, hyundai_card, naver_pay, toss_bank, woori_bank  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 INPUT_DIR = BASE_DIR / "input"
@@ -43,6 +43,7 @@ LEDGER_FILE_RULES = [
     ("거래내역조회", woori_bank.parse),  # 우리은행 인터넷뱅킹 기본 다운로드 파일명
     ("현대카드", hyundai_card.parse),
     ("hyundaicard", hyundai_card.parse),
+    ("토스뱅크", toss_bank.parse),
 ]
 # 파일명에 이 키워드가 들어있으면 "상품명 보충용" 조회 자료로만 쓴다.
 LOOKUP_FILE_RULES = [
@@ -53,7 +54,7 @@ LOOKUP_FILE_RULES = [
 ]
 # 아직 파서가 없는 은행/카드사 - 실제 파일을 받으면 parsers/ 에 파서를 추가하고
 # 여기 LEDGER_FILE_RULES 에 한 줄만 추가하면 됨.
-KNOWN_BUT_UNSUPPORTED = ["토스뱅크", "모임통장", "모임체크카드"]
+KNOWN_BUT_UNSUPPORTED = ["모임통장", "모임체크카드"]
 
 
 def discover_and_load():
@@ -133,11 +134,18 @@ def enrich_memo(rows, amount_lookup):
     같은 날 뿐 아니라 하루 전/하루 후까지 넓혀서 찾는다. 그중 시각이 가장 가까운
     걸 고른다.
 
-    rules/memo_mapping.csv 고정 매핑이 먼저 적용되어 이미 메모가 채워진 행은
-    (자동 상품명 조회 결과보다 고정 매핑을 우선하기 위해) 건드리지 않는다.
+    토스뱅크 파일 자체에 적혀있던 메모처럼 이미 메모가 채워진 행은 건드리지
+    않는다. rules/memo_mapping.csv 고정 매핑(apply_memo_rules)보다 먼저
+    실행해서, 실제 주문내역으로 확인된 상품명을 고정 매핑보다 우선 쓴다.
 
     현대카드로 결제된 항목은 전부 앱/서비스 정기결제(구독)라서, 자동으로 찾은
-    상품명 뒤에 '구독'을 붙여준다. (이미 '구독'으로 끝나면 중복으로 붙이지 않음)"""
+    상품명 뒤에 '구독'을 붙여준다. (이미 '구독'으로 끝나면 중복으로 붙이지 않음)
+
+    이미 가계부.xlsx에 저장되어 있던 과거 거래(existing_rows)에도 이 함수를
+    다시 돌릴 수 있는데, 그 경우 거래일자/거래시간 칸에 날짜(date)/시각(time)이
+    아니라 둘 다 같은 datetime 값이 들어있다 (엑셀에 저장할 때 두 칸에 같은
+    datetime을 넣고 표시 형식만 다르게 줬기 때문). 그대로 두면 날짜 비교가
+    안 맞아서 매칭이 하나도 안 되므로, 먼저 date/time으로 변환해서 쓴다."""
     for row in rows:
         row.setdefault("메모", "")
         if row["메모"]:
@@ -145,13 +153,19 @@ def enrich_memo(rows, amount_lookup):
         if not any(kw in row["적요"] for kw in _MEMO_KEYWORDS):
             continue
         amount = row["출금"] or row["입금"]
+        tx_date = row["거래일자"]
+        if isinstance(tx_date, datetime.datetime):
+            tx_date = tx_date.date()
+        tx_time = row["거래시간"]
+        if isinstance(tx_time, datetime.datetime):
+            tx_time = tx_time.time()
         candidates = []
         for delta in (0, -1, 1):
-            day = row["거래일자"] + datetime.timedelta(days=delta)
+            day = tx_date + datetime.timedelta(days=delta)
             candidates.extend(amount_lookup.get((day, amount), []))
         if not candidates:
             continue
-        row_minutes = row["거래시간"].hour * 60 + row["거래시간"].minute
+        row_minutes = tx_time.hour * 60 + tx_time.minute
         _, best_product = min(candidates, key=lambda c: abs(c[0] - row_minutes))
         if row.get("은행") == "현대카드" and not best_product.endswith("구독"):
             best_product = f"{best_product} 구독"
@@ -175,11 +189,16 @@ def load_memo_rules():
 
 
 def apply_memo_rules(rows, memo_rules):
-    """rules/memo_mapping.csv 고정 매핑을 적용한다. (enrich_memo의 자동 상품명 조회보다
-    먼저 실행해서, 고정 매핑이 등록된 가맹점은 항상 그 값을 우선 쓰게 한다.)
-    파일에 적힌 메모 값을 그대로 쓴다 (구독 여부 등은 파일에서 직접 관리)."""
+    """rules/memo_mapping.csv 고정 매핑을 적용한다. enrich_memo(쿠팡/네이버페이/
+    구글플레이 실제 주문내역으로 찾은 상품명)보다 나중에 실행해서, 실제 주문내역이
+    있으면 그걸 우선 쓰고, 그래도 메모가 비어있는 행에만 고정 매핑을 채운다.
+
+    토스뱅크 파서처럼 파일 자체에 이미 사용자가 적어둔 메모가 있는 행도
+    (가장 정확한 정보이므로) 고정 매핑으로 덮어쓰지 않고 그대로 둔다."""
     for row in rows:
         row.setdefault("메모", "")
+        if row["메모"]:
+            continue
         for keyword, memo in memo_rules:
             if keyword in row["적요"]:
                 row["메모"] = memo
@@ -340,11 +359,13 @@ def main():
 
     # 쿠팡/네이버페이/구글플레이 상품명, 고정 가맹점명 매핑은
     # AUTO_FILL 설정과 상관없이 항상 '메모' 칸에 채워준다.
-    # (rules/memo_mapping.csv 고정 매핑을 먼저 적용해서, 등록해둔 가맹점은
-    #  자동 상품명 조회 결과보다 고정 매핑을 우선 쓰게 한다.)
+    # 우선순위: 실제 주문내역으로 찾은 상품명(enrich_memo) > memo_mapping.csv
+    # 고정 매핑(apply_memo_rules). 실제 주문내역을 먼저 적용해서, 있으면 그걸
+    # 쓰고 그래도 비어있는 칸만 고정 매핑으로 채운다.
     amount_lookup = build_amount_lookup(lookup_entries)
-    apply_memo_rules(new_rows, load_memo_rules())
+    memo_rules = load_memo_rules()
     enrich_memo(new_rows, amount_lookup)
+    apply_memo_rules(new_rows, memo_rules)
 
     if AUTO_FILL:
         rules = load_rules()
@@ -356,6 +377,15 @@ def main():
             row["소분류"] = ""
 
     existing_rows = load_existing_rows()
+
+    # 메모가 비어있는 거래는 (새 거래인지 예전 거래인지 상관없이) 최신 규칙/자료로
+    # 채운다. 메모가 이미 있는 행은 절대 건드리지 않는다 (손으로 채운 메모 보호).
+    # 우선순위는 위와 동일: 실제 주문내역(enrich_memo) > 고정 매핑(apply_memo_rules).
+    backfilled_before = sum(1 for r in existing_rows if not r.get("메모"))
+    enrich_memo(existing_rows, amount_lookup)
+    apply_memo_rules(existing_rows, memo_rules)
+    backfilled = backfilled_before - sum(1 for r in existing_rows if not r.get("메모"))
+
     existing_keys = {make_key(r) for r in existing_rows}
 
     added = [r for r in new_rows if make_key(r) not in existing_keys]
@@ -375,6 +405,8 @@ def main():
     print(f"이번에 읽은 거래: {len(new_rows)}건")
     print(f"이미 있어서 건너뜀(중복): {skipped}건")
     print(f"새로 추가됨: {len(added)}건")
+    if backfilled:
+        print(f"메모가 비어있던 과거 거래 중 새로 채운 건수: {backfilled}건")
     print(f"저장 위치: {OUTPUT_PATH}")
 
     if not AUTO_FILL:
