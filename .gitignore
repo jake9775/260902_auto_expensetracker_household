@@ -7,3 +7,4 @@ __pycache__/
 
 # Claude Code(OMC) 내부 세션 상태 - 프로젝트 소스 아님
 .omc/
+.omx/

@@ -10,10 +10,15 @@
   2. 우리은행/현대카드 내역을 공통 형식으로 정리한다.
   3. 네이버페이/쿠팡 내역은 "상품명 보충용" 자료로만 써서 메모 칸을 채운다.
   4. (AUTO_FILL=True일 때만) rules/categories.csv 규칙으로 대분류/소분류를 자동으로 채운다.
-  5. output/가계부.xlsx 에 기존 내용과 합쳐서(중복 제외) 새로 저장한다.
+  5. output/ 폴더에 "yymm00_생활비가계부_claudecli.xlsx" 이름으로 저장한다.
+     (yymm00 은 이번에 처리한 입력 파일들 중 가장 최근 거래월 기준. 예: 가장 최근
+     거래가 2026년 8월이면 "260800_생활비가계부_claudecli.xlsx")
+     기존 달 파일은 그대로 두고, 최근 거래월에 해당하는 파일만 새로 만들거나
+     덮어써서 갱신한다(같은 달에 여러 번 실행해도 그 달 파일 하나로 계속 합쳐짐).
 """
 import csv
 import datetime
+import re
 import sys
 from pathlib import Path
 
@@ -21,13 +26,17 @@ import openpyxl
 from openpyxl.styles import Font
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from parsers import coupang, google_play, hyundai_card, naver_pay, toss_bank, woori_bank  # noqa: E402
+from parsers import coupang, coupang_eats, google_play, hyundai_card, naver_pay, toss_bank, woori_bank  # noqa: E402
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 INPUT_DIR = BASE_DIR / "input"
 RULES_PATH = BASE_DIR / "rules" / "categories.csv"
 MEMO_RULES_PATH = BASE_DIR / "rules" / "memo_mapping.csv"
-OUTPUT_PATH = BASE_DIR / "output" / "가계부.xlsx"
+OUTPUT_DIR = BASE_DIR / "output"
+# 예전에 쓰던 고정 파일명. 새로 저장할 때는 더 이상 쓰지 않지만, 아직 이 이름으로만
+# 저장된 과거 결과물이 있으면 처음 한 번은 여기서 이어받아 합친다(마이그레이션용).
+LEGACY_OUTPUT_PATH = OUTPUT_DIR / "가계부.xlsx"
+OUTPUT_NAME_RE = re.compile(r"^(\d{6})_생활비가계부_claudecli\.xlsx$")
 
 COLUMNS = ["은행", "거래일자", "거래시간", "적요", "출금", "입금", "내용", "대분류", "소분류", "메모"]
 
@@ -46,9 +55,12 @@ LEDGER_FILE_RULES = [
     ("토스뱅크", toss_bank.parse),
 ]
 # 파일명에 이 키워드가 들어있으면 "상품명 보충용" 조회 자료로만 쓴다.
+# 주의: "쿠팡이츠"가 "쿠팡"의 부분 문자열이라, 쿠팡이츠 파일이 쿠팡(PDF) 파서로
+# 잘못 넘어가지 않도록 반드시 "쿠팡이츠"를 "쿠팡"보다 먼저 검사해야 한다.
 LOOKUP_FILE_RULES = [
     ("네이버페이", naver_pay.extract_entries),
     ("npay", naver_pay.extract_entries),
+    ("쿠팡이츠", coupang_eats.extract_entries),
     ("쿠팡", coupang.extract_entries),
     ("구글플레이", google_play.extract_entries),
 ]
@@ -141,7 +153,7 @@ def enrich_memo(rows, amount_lookup):
     현대카드로 결제된 항목은 전부 앱/서비스 정기결제(구독)라서, 자동으로 찾은
     상품명 뒤에 '구독'을 붙여준다. (이미 '구독'으로 끝나면 중복으로 붙이지 않음)
 
-    이미 가계부.xlsx에 저장되어 있던 과거 거래(existing_rows)에도 이 함수를
+    이미 저장되어 있던 과거 거래(existing_rows)에도 이 함수를
     다시 돌릴 수 있는데, 그 경우 거래일자/거래시간 칸에 날짜(date)/시각(time)이
     아니라 둘 다 같은 datetime 값이 들어있다 (엑셀에 저장할 때 두 칸에 같은
     datetime을 넣고 표시 형식만 다르게 줬기 때문). 그대로 두면 날짜 비교가
@@ -271,10 +283,43 @@ def make_key(row):
     )
 
 
-def load_existing_rows():
-    if not OUTPUT_PATH.exists():
+def resolve_target_path(new_rows, lookup_entries):
+    """이번 실행에서 처리한 입력 파일들 중 가장 최근 거래월을 기준으로
+    저장할 파일 경로("yymm00_생활비가계부_claudecli.xlsx")를 정한다."""
+    dates = []
+    for row in new_rows:
+        d = row["거래일자"]
+        dates.append(d.date() if isinstance(d, datetime.datetime) else d)
+    for entry in lookup_entries:
+        d = entry[0]
+        dates.append(d.date() if isinstance(d, datetime.datetime) else d)
+    latest = max(dates)
+    yymm00 = f"{latest.year % 100:02d}{latest.month:02d}00"
+    return OUTPUT_DIR / f"{yymm00}_생활비가계부_claudecli.xlsx"
+
+
+def find_latest_existing_output():
+    """output/ 폴더에서 "yymm00_생활비가계부_claudecli.xlsx" 형식 파일 중
+    가장 최근(연월이 가장 큰) 것을 찾는다. 없으면 예전 고정 파일명을 찾고,
+    그마저 없으면 None을 돌려준다(과거 내역이 아예 없는 첫 실행)."""
+    candidates = []
+    if OUTPUT_DIR.exists():
+        for path in OUTPUT_DIR.iterdir():
+            m = OUTPUT_NAME_RE.match(path.name)
+            if m:
+                candidates.append((m.group(1), path))
+    if candidates:
+        candidates.sort(key=lambda item: item[0])
+        return candidates[-1][1]
+    if LEGACY_OUTPUT_PATH.exists():
+        return LEGACY_OUTPUT_PATH
+    return None
+
+
+def load_existing_rows(path):
+    if path is None or not path.exists():
         return []
-    wb = openpyxl.load_workbook(OUTPUT_PATH)
+    wb = openpyxl.load_workbook(path)
     ws = wb.active
     header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
     rows = []
@@ -307,8 +352,8 @@ def _combine_datetime(date_value, time_value):
     return datetime.datetime.combine(d, t)
 
 
-def write_output(rows):
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+def write_output(rows, target_path):
+    target_path.parent.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "가계부"
@@ -345,7 +390,7 @@ def write_output(rows):
     ws.auto_filter.ref = f"A1:{last_col}{ws.max_row}"
     ws.freeze_panes = "A2"
 
-    wb.save(OUTPUT_PATH)
+    wb.save(target_path)
 
 
 def main():
@@ -376,7 +421,9 @@ def main():
             row["대분류"] = ""
             row["소분류"] = ""
 
-    existing_rows = load_existing_rows()
+    target_path = resolve_target_path(new_rows, lookup_entries)
+    source_path = target_path if target_path.exists() else find_latest_existing_output()
+    existing_rows = load_existing_rows(source_path)
 
     # 메모가 비어있는 거래는 (새 거래인지 예전 거래인지 상관없이) 최신 규칙/자료로
     # 채운다. 메모가 이미 있는 행은 절대 건드리지 않는다 (손으로 채운 메모 보호).
@@ -399,7 +446,7 @@ def main():
     all_rows.sort(key=lambda r: r["은행"])
     all_rows.sort(key=lambda r: _date_str(r["거래일자"])[:7], reverse=True)
 
-    write_output(all_rows)
+    write_output(all_rows, target_path)
 
     print()
     print(f"이번에 읽은 거래: {len(new_rows)}건")
@@ -407,17 +454,19 @@ def main():
     print(f"새로 추가됨: {len(added)}건")
     if backfilled:
         print(f"메모가 비어있던 과거 거래 중 새로 채운 건수: {backfilled}건")
-    print(f"저장 위치: {OUTPUT_PATH}")
+    if source_path and source_path != target_path:
+        print(f"이전 내역 불러온 파일: {source_path.name}")
+    print(f"저장 위치: {target_path}")
 
     if not AUTO_FILL:
         print()
         print("자동 분류가 꺼져있어 '내용/대분류/소분류'는 전부 빈칸으로 저장했습니다. "
-              "가계부.xlsx에서 직접 채워주세요.")
+              f"{target_path.name}에서 직접 채워주세요.")
     else:
         uncategorized = [r for r in added if r.get("대분류") in ("미분류", None)]
         if uncategorized:
             print()
-            print(f"[확인 필요] 미분류로 남은 항목 {len(uncategorized)}건 (가계부.xlsx에서 직접 채워주세요):")
+            print(f"[확인 필요] 미분류로 남은 항목 {len(uncategorized)}건 ({target_path.name}에서 직접 채워주세요):")
             for r in uncategorized[:30]:
                 amt = r["출금"] or r["입금"]
                 print(f"  - {r['거래일자']} {r['적요']} ({amt:,}원)")
