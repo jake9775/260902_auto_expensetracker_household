@@ -1,45 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-구글플레이 영수증 CSV 파서.
+구글플레이 결제내역 엑셀 파일 파서.
 
-Gmail API 연동 없이, 매달 Claude한테 "이번 달 구글플레이 영수증 찾아줘"라고
-요청하면 이 형식의 CSV 파일을 만들어서 input/ 폴더에 넣어준다.
 naver_pay.py / coupang.py 와 마찬가지로 별도 거래 행을 만들지 않고,
 (날짜, 시각, 금액) -> 상품명 조회용 목록만 만든다.
 
-CSV 형식 (헤더 포함):
-  결제일시,상품명,금액
-  2026-08-29 22:06:32,ChatGPT Plus (ChatGPT),29000
+헤더: 결제일시, PG사, 상점명, 상품명, 결제금액, 구분, 주문번호, 결제방법
 """
-import csv
 import datetime
+import openpyxl
 
 
 def extract_entries(path):
-    """[(date, hour, minute, amount, product_name), ...] 목록을 돌려준다."""
+    """[(date, hour, minute, amount, product_name), ...] 목록을 돌려준다.
+    '결제'가 아닌 항목(환불/취소 등)은 제외한다."""
+    wb = openpyxl.load_workbook(path, data_only=True)
+    ws = wb[wb.sheetnames[0]]
+
     entries = []
-    with open(path, encoding="utf-8-sig", newline="") as f:
-        for row in csv.DictReader(f):
-            pay_dt = (row.get("결제일시") or "").strip()
-            product = (row.get("상품명") or "").strip()
-            amount_str = (row.get("금액") or "").strip()
-            if not pay_dt or not amount_str:
-                continue
-            dt = _parse_datetime(pay_dt)
-            if dt is None:
-                continue
-            try:
-                amount = int(amount_str.replace(",", ""))
-            except ValueError:
-                continue
-            entries.append((dt.date(), dt.hour, dt.minute, amount, product))
+    for raw in ws.iter_rows(min_row=2, values_only=True):
+        if raw is None or len(raw) < 6:
+            continue
+        pay_dt, _pg, _shop, product, amount, kind = raw[:6]
+        if not pay_dt or amount in (None, "") or kind != "결제":
+            continue
+        dt = _parse_datetime(pay_dt)
+        if dt is None:
+            continue
+        product = str(product or "").strip()
+        entries.append((dt.date(), dt.hour, dt.minute, int(amount), product))
     return entries
 
 
 def _parse_datetime(value):
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-        try:
-            return datetime.datetime.strptime(value, fmt)
-        except ValueError:
-            continue
+    if isinstance(value, datetime.datetime):
+        return value
+    if isinstance(value, str):
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                return datetime.datetime.strptime(value.strip(), fmt)
+            except ValueError:
+                continue
     return None

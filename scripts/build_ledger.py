@@ -184,19 +184,58 @@ def enrich_memo(rows, amount_lookup):
         row["메모"] = best_product
 
 
+_AND_SPLIT_RE = re.compile(r"\s+AND\s+")
+_OR_SPLIT_RE = re.compile(r"\s+OR\s+")
+
+
+def _split_keywords(keyword):
+    """키워드 칸을 ' OR '로 먼저 나누고, 각 조각을 다시 ' AND '로 나눠
+    'OR-그룹의 목록'을 만든다. (예: 'A AND B OR C' -> ((A, B), (C,)) : OR
+    그룹 중 하나라도 AND 조건을 전부 만족하면 매칭된다.
+
+    'AND'/'OR' 는 앞뒤에 공백이 둘 다 있어야만 구분자로 인식된다(대문자
+    고정). 이렇게 하지 않으면 가맹점명에 우연히 'AND'나 'OR'가 붙어있는
+    경우(예: '스타벅스AND점', '카페OR제리')까지 잘못 나뉠 수 있다. ' AND '나
+    ' OR '가 없으면 기존처럼 키워드 하나만 있는 OR-그룹 하나짜리 목록이
+    되어 동작이 그대로 유지된다."""
+    groups = []
+    for or_part in _OR_SPLIT_RE.split(keyword):
+        and_keywords = tuple(part.strip() for part in _AND_SPLIT_RE.split(or_part) if part.strip())
+        if and_keywords:
+            groups.append(and_keywords)
+    return tuple(groups)
+
+
+def _keywords_match(keyword_groups, text):
+    """_split_keywords()가 만든 OR-그룹 목록이 text에 매칭되는지 확인한다.
+    (OR-그룹 중 하나라도 그 안의 키워드가 전부 들어있으면 매칭)"""
+    return any(all(kw in text for kw in group) for group in keyword_groups)
+
+
 def load_memo_rules():
     """rules/memo_mapping.csv 를 읽는다. (가맹점명 키워드 -> 메모 고정 매핑)
     구글플레이처럼 매달 내역이 바뀌는 게 아니라, 항상 같은 뜻인 가맹점명
-    (예: 'ktIOT자동이체' = 차량 커넥티드 서비스 요금)을 고정으로 채울 때 쓴다."""
+    (예: 'ktIOT자동이체' = 차량 커넥티드 서비스 요금)을 고정으로 채울 때 쓴다.
+
+    '키워드' 칸에 ' AND '로 여러 단어를 이어 적으면(예: '스타벅스 AND 배달') 그 단어들이
+    적요에 전부 들어있을 때만(AND 조건) 매핑이 적용된다. ' OR '로 이어 적으면
+    (예: '스타벅스 OR 이디야') 둘 중 하나만 들어있어도 매핑이 적용된다(OR 조건).
+    AND와 OR을 섞어 쓸 수도 있다(예: 'A AND B OR C' -> (A와 B가 둘 다 있음) 또는 (C가 있음)).
+
+    '금액' 칸은 선택사항이다. 비워두면 금액과 상관없이 적용되고, 값을 적어두면
+    그 금액일 때만 적용된다. (예: '하나카드'라는 적요가 여러 다른 서비스에
+    공통으로 찍혀서 금액으로 구분해야 하는 경우에 씀)"""
     if not MEMO_RULES_PATH.exists():
         return []
     rules = []
     with open(MEMO_RULES_PATH, encoding="utf-8-sig") as f:
         for item in csv.DictReader(f):
-            keyword = (item.get("키워드") or "").strip()
+            keyword_groups = _split_keywords((item.get("키워드") or "").strip())
             memo = (item.get("메모") or "").strip()
-            if keyword and memo:
-                rules.append((keyword, memo))
+            amount_str = (item.get("금액") or "").strip().replace(",", "")
+            amount = int(amount_str) if amount_str else None
+            if keyword_groups and memo:
+                rules.append((keyword_groups, memo, amount))
     return rules
 
 
@@ -211,20 +250,23 @@ def apply_memo_rules(rows, memo_rules):
         row.setdefault("메모", "")
         if row["메모"]:
             continue
-        for keyword, memo in memo_rules:
-            if keyword in row["적요"]:
+        row_amount = _amount(row["출금"] or row["입금"])
+        for keyword_groups, memo, amount in memo_rules:
+            if _keywords_match(keyword_groups, row["적요"]) and (amount is None or amount == row_amount):
                 row["메모"] = memo
                 break
 
 
 def load_rules():
+    """rules/categories.csv 를 읽는다. '키워드' 칸의 AND/OR 조합 문법은
+    load_memo_rules()와 동일하다."""
     rules = []
     with open(RULES_PATH, encoding="utf-8-sig") as f:
         for item in csv.DictReader(f):
-            keyword = (item.get("키워드") or "").strip()
-            if not keyword:
+            keyword_groups = _split_keywords((item.get("키워드") or "").strip())
+            if not keyword_groups:
                 continue
-            rules.append((keyword, (item.get("대분류") or "").strip(), (item.get("소분류") or "").strip()))
+            rules.append((keyword_groups, (item.get("대분류") or "").strip(), (item.get("소분류") or "").strip()))
     return rules
 
 
@@ -233,8 +275,9 @@ def categorize(rows, rules):
         if row.get("대분류"):  # 파서가 이미 확정한 카테고리는 건드리지 않음
             continue
         text = f"{row['적요']} {row['내용']} {row.get('메모', '')}".lower()
-        for keyword, main, sub in rules:
-            if keyword.lower() in text:
+        for keyword_groups, main, sub in rules:
+            lower_groups = tuple(tuple(kw.lower() for kw in group) for group in keyword_groups)
+            if _keywords_match(lower_groups, text):
                 row["대분류"], row["소분류"] = main, sub
                 break
         else:
